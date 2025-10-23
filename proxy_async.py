@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import base64
+import contextlib
 import bcrypt
 import logging
 import os
@@ -162,6 +163,99 @@ def authenticate(headers: Dict[str, str]) -> bool:
         return False
 
 
+def _is_application_data_after_close(exc: ssl.SSLError) -> bool:
+    reason = getattr(exc, "reason", "") or ""
+    text = str(exc)
+    return "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in reason or (
+        "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in text
+    )
+
+
+async def close_stream(writer: Optional[asyncio.StreamWriter]) -> None:
+    if writer is None:
+        return
+    if writer.is_closing():
+        wait_closed = getattr(writer, "wait_closed", None)
+        if callable(wait_closed):
+            with contextlib.suppress(Exception):
+                await wait_closed()
+        return
+    writer.close()
+    wait_closed = getattr(writer, "wait_closed", None)
+    if callable(wait_closed):
+        with contextlib.suppress(Exception):
+            await wait_closed()
+
+
+async def safe_drain(writer: asyncio.StreamWriter, description: str) -> bool:
+    try:
+        await writer.drain()
+        return True
+    except asyncio.CancelledError:
+        raise
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        logger.debug("%s: соединение закрыто (%s)", description, exc)
+    except ssl.SSLError as exc:
+        if _is_application_data_after_close(exc):
+            logger.debug("%s: SSL-соединение закрыто удалённой стороной", description)
+        else:
+            logger.debug(
+                "%s: SSL-ошибка при ожидании опустошения буфера: %s",
+                description,
+                exc,
+                exc_info=Settings.debug,
+            )
+    except Exception as exc:
+        logger.debug(
+            "%s: ошибка при ожидании опустошения буфера: %s",
+            description,
+            exc,
+            exc_info=Settings.debug,
+        )
+    return False
+
+
+async def pipe_stream(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    description: str,
+) -> None:
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    reader.read(65536), timeout=Settings.communication_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.debug("%s: превышен таймаут ожидания данных", description)
+                break
+            if not data:
+                break
+            writer.write(data)
+            if not await safe_drain(writer, f"{description}: отправка данных"):
+                break
+    except asyncio.CancelledError:
+        raise
+    except ssl.SSLError as exc:
+        if _is_application_data_after_close(exc):
+            logger.debug("%s: SSL-соединение закрыто удалённой стороной", description)
+        else:
+            logger.debug(
+                "%s: SSL-ошибка при пересылке данных: %s",
+                description,
+                exc,
+                exc_info=Settings.debug,
+            )
+    except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+        logger.debug("%s: соединение разорвано: %s", description, exc)
+    except Exception:
+        logger.debug(
+            "%s: неожиданная ошибка при пересылке данных", description, exc_info=True
+        )
+    finally:
+        await close_stream(writer)
+
+
 async def send_auth_required(writer: asyncio.StreamWriter):
     msg = (
         "HTTP/1.1 407 Proxy Authentication Required\r\n"
@@ -169,8 +263,8 @@ async def send_auth_required(writer: asyncio.StreamWriter):
         "Connection: close\r\n\r\n"
     )
     writer.write(msg.encode())
-    await writer.drain()
-    writer.close()
+    await safe_drain(writer, "Отправка ответа 407 клиенту")
+    await close_stream(writer)
 
 
 async def open_upstream_connection() -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -194,25 +288,26 @@ async def open_upstream_connection() -> Tuple[asyncio.StreamReader, asyncio.Stre
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peername = writer.get_extra_info("peername")
     logger.debug("Подключился клиент %s", peername)
+    remote_reader: Optional[asyncio.StreamReader] = None
+    remote_writer: Optional[asyncio.StreamWriter] = None
     try:
-        # читаем первую строку (метод path версия)
         request_line = await asyncio.wait_for(
             reader.readline(), timeout=Settings.request_timeout
         )
         if not request_line:
             logger.debug("Клиент %s закрыл соединение до отправки запроса", peername)
-            writer.close()
+            await close_stream(writer)
             return
+
         request_line_str = request_line.decode(errors="ignore").strip()
         logger.debug("Получена стартовая строка запроса: %s", request_line_str)
         parts = request_line_str.split(" ", 2)
         if len(parts) != 3:
             logger.debug("Неверная стартовая строка запроса от %s", peername)
-            writer.close()
+            await close_stream(writer)
             return
         method, path, version = parts
 
-        # читаем заголовки
         raw_headers = []
         while True:
             line = await reader.readline()
@@ -221,7 +316,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             raw_headers.append(line.decode(errors="ignore").strip())
         headers = parse_headers(raw_headers)
 
-        # проверка аутентификации
         if not authenticate(headers):
             logger.warning("Неуспешная авторизация от %s", peername)
             await send_auth_required(writer)
@@ -230,13 +324,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if method == "CONNECT":
             if ":" not in path:
                 logger.debug("CONNECT без указания порта от %s", peername)
-                writer.close()
+                await close_stream(writer)
                 return
             host, port_str = path.split(":", 1)
-            port = int(port_str)
+            try:
+                port = int(port_str)
+            except ValueError:
+                logger.debug("CONNECT с некорректным портом %s от %s", port_str, peername)
+                await close_stream(writer)
+                return
+
             logger.debug("Попытка CONNECT к %s:%s от %s", host, port_str, peername)
-            remote_reader: Optional[asyncio.StreamReader] = None
-            remote_writer: Optional[asyncio.StreamWriter] = None
             try:
                 if Settings.upstream_proxy_host:
                     logger.debug(
@@ -258,7 +356,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         )
                     request_data = "\r\n".join(lines) + "\r\n\r\n"
                     remote_writer.write(request_data.encode())
-                    await remote_writer.drain()
+                    if not await safe_drain(
+                        remote_writer,
+                        f"CONNECT {connect_target}: ожидание подтверждения апстрима",
+                    ):
+                        await close_stream(remote_writer)
+                        remote_writer = None
+                        await close_stream(writer)
+                        return
                     response_line = await asyncio.wait_for(
                         remote_reader.readline(), timeout=Settings.request_timeout
                     )
@@ -286,41 +391,33 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 logger.warning(
                     "Не удалось установить CONNECT к %s:%s: %s", host, port_str, e
                 )
-                if remote_writer is not None:
-                    remote_writer.close()
+                await close_stream(remote_writer)
+                remote_writer = None
                 writer.write(f"HTTP/1.1 502 Bad Gateway: {e}\r\n\r\n".encode())
-                await writer.drain()
-                writer.close()
+                await safe_drain(writer, f"Отправка 502 клиенту {peername}")
+                await close_stream(writer)
                 return
 
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            await writer.drain()
+            if not await safe_drain(
+                writer, f"Отправка подтверждения CONNECT клиенту {peername}"
+            ):
+                await close_stream(remote_writer)
+                remote_writer = None
+                await close_stream(writer)
+                return
             logger.debug("CONNECT к %s:%s установлен", host, port_str)
 
-            async def pipe(r, w):
-                try:
-                    while True:
-                        data = await asyncio.wait_for(
-                            r.read(65536), timeout=Settings.communication_timeout
-                        )
-                        if not data:
-                            break
-                        w.write(data)
-                        await w.drain()
-                except Exception:
-                    logger.debug("Соединение разорвано", exc_info=True)
-                finally:
-                    w.close()
-
             await asyncio.gather(
-                pipe(reader, remote_writer),
-                pipe(remote_reader, writer)
+                pipe_stream(reader, remote_writer, f"{peername} -> {host}:{port}"),
+                pipe_stream(remote_reader, writer, f"{host}:{port} -> {peername}"),
             )
+            remote_writer = None
 
         else:
             parsed = urlsplit(path)
             if parsed.scheme and parsed.netloc:
-                host = parsed.hostname
+                host = parsed.hostname or ""
                 port = parsed.port or (443 if parsed.scheme == "https" else 80)
                 origin_path = parsed.path or "/"
                 if parsed.query:
@@ -331,17 +428,27 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     logger.debug(
                         "Нет заголовка Host для запроса %s от %s", path, peername
                     )
-                    writer.close()
+                    await close_stream(writer)
                     return
                 if ":" in host_header:
                     host, port_str = host_header.rsplit(":", 1)
-                    port = int(port_str)
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        logger.debug(
+                            "Некорректный порт в Host (%s) от %s", host_header, peername
+                        )
+                        await close_stream(writer)
+                        return
                 else:
                     host, port = host_header, 80
                 origin_path = path or "/"
 
-            remote_reader = None
-            remote_writer = None
+            if not host:
+                logger.debug("Не удалось определить целевой хост для %s", peername)
+                await close_stream(writer)
+                return
+
             try:
                 if Settings.upstream_proxy_host:
                     remote_reader, remote_writer = await open_upstream_connection()
@@ -354,11 +461,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 logger.warning(
                     "Не удалось подключиться к %s:%s: %s", host, port, e
                 )
-                if remote_writer is not None:
-                    remote_writer.close()
+                await close_stream(remote_writer)
+                remote_writer = None
                 writer.write(f"HTTP/1.1 502 Bad Gateway: {e}\r\n\r\n".encode())
-                await writer.drain()
-                writer.close()
+                await safe_drain(writer, f"Отправка 502 клиенту {peername}")
+                await close_stream(writer)
                 return
 
             fwd_headers = strip_hop_by_hop(headers)
@@ -389,7 +496,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             header_str = "".join(f"{k}: {v}\r\n" for k, v in fwd_headers.items())
             req = f"{method} {request_target} HTTP/1.1\r\n{header_str}\r\n"
             remote_writer.write(req.encode())
-            await remote_writer.drain()
+            if not await safe_drain(
+                remote_writer, f"Отправка {method} запроса на {host}:{port}"
+            ):
+                await close_stream(remote_writer)
+                remote_writer = None
+                await close_stream(writer)
+                return
             logger.debug(
                 "Проксируем %s %s:%s%s",
                 method,
@@ -398,29 +511,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 f" ({request_target})" if request_target else "",
             )
 
-            async def pipe(r, w):
-                try:
-                    while True:
-                        data = await asyncio.wait_for(
-                            r.read(65536), timeout=Settings.communication_timeout
-                        )
-                        if not data:
-                            break
-                        w.write(data)
-                        await w.drain()
-                except Exception:
-                    logger.debug("Соединение разорвано", exc_info=True)
-                finally:
-                    w.close()
-
             await asyncio.gather(
-                pipe(reader, remote_writer),
-                pipe(remote_reader, writer)
+                pipe_stream(reader, remote_writer, f"{peername} -> {host}:{port}"),
+                pipe_stream(remote_reader, writer, f"{host}:{port} -> {peername}"),
             )
+            remote_writer = None
 
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.exception("Ошибка обработки клиента %s", peername)
-        writer.close()
+        await close_stream(writer)
+    finally:
+        await close_stream(remote_writer)
 
 
 # ==== ЗАПУСК ====
