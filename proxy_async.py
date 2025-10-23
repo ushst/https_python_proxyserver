@@ -7,7 +7,7 @@ import logging
 import os
 import ssl
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
@@ -31,6 +31,35 @@ class Settings:
     ssl_private_key_path = os.getenv(
         "SSL_KEY", "/etc/letsencrypt/live/example.com/privkey.pem"
     )
+
+    upstream_proxy_url = os.getenv("UPSTREAM_PROXY", "").strip()
+    upstream_proxy_scheme: Optional[str] = None
+    upstream_proxy_host: Optional[str] = None
+    upstream_proxy_port: Optional[int] = None
+    upstream_proxy_username: Optional[str] = None
+    upstream_proxy_password: Optional[str] = None
+    upstream_proxy_authorization: Optional[str] = None
+    upstream_proxy_ssl_context: Optional[ssl.SSLContext] = None
+
+    if upstream_proxy_url:
+        parsed_upstream = urlsplit(
+            upstream_proxy_url
+            if "://" in upstream_proxy_url
+            else f"http://{upstream_proxy_url}"
+        )
+        upstream_proxy_scheme = parsed_upstream.scheme or "http"
+        upstream_proxy_host = parsed_upstream.hostname
+        default_port = 443 if upstream_proxy_scheme == "https" else 8080
+        upstream_proxy_port = parsed_upstream.port or default_port
+        upstream_proxy_username = parsed_upstream.username
+        upstream_proxy_password = parsed_upstream.password
+        if upstream_proxy_username is not None:
+            credentials = f"{upstream_proxy_username}:{upstream_proxy_password or ''}"
+            upstream_proxy_authorization = "Basic " + base64.b64encode(
+                credentials.encode("utf-8")
+            ).decode("ascii")
+        if upstream_proxy_scheme == "https":
+            upstream_proxy_ssl_context = ssl.create_default_context()
 
 
 logger = logging.getLogger("https_proxy")
@@ -144,6 +173,23 @@ async def send_auth_required(writer: asyncio.StreamWriter):
     writer.close()
 
 
+async def open_upstream_connection() -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    if not Settings.upstream_proxy_host:
+        raise RuntimeError("Апстрим-прокси не настроен")
+    connect_kwargs = {}
+    if Settings.upstream_proxy_scheme == "https":
+        connect_kwargs["ssl"] = Settings.upstream_proxy_ssl_context
+        connect_kwargs["server_hostname"] = Settings.upstream_proxy_host
+    return await asyncio.wait_for(
+        asyncio.open_connection(
+            Settings.upstream_proxy_host,
+            Settings.upstream_proxy_port,
+            **connect_kwargs,
+        ),
+        timeout=Settings.request_timeout,
+    )
+
+
 # ==== ПРОКСИ ====
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peername = writer.get_extra_info("peername")
@@ -189,15 +235,59 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             host, port_str = path.split(":", 1)
             port = int(port_str)
             logger.debug("Попытка CONNECT к %s:%s от %s", host, port_str, peername)
+            remote_reader: Optional[asyncio.StreamReader] = None
+            remote_writer: Optional[asyncio.StreamWriter] = None
             try:
-                remote_reader, remote_writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
-                    timeout=Settings.request_timeout
-                )
+                if Settings.upstream_proxy_host:
+                    logger.debug(
+                        "CONNECT %s:%s через апстрим %s:%s",
+                        host,
+                        port_str,
+                        Settings.upstream_proxy_host,
+                        Settings.upstream_proxy_port,
+                    )
+                    remote_reader, remote_writer = await open_upstream_connection()
+                    connect_target = f"{host}:{port}"
+                    lines = [
+                        f"CONNECT {connect_target} HTTP/1.1",
+                        f"Host: {connect_target}",
+                    ]
+                    if Settings.upstream_proxy_authorization:
+                        lines.append(
+                            f"Proxy-Authorization: {Settings.upstream_proxy_authorization}"
+                        )
+                    request_data = "\r\n".join(lines) + "\r\n\r\n"
+                    remote_writer.write(request_data.encode())
+                    await remote_writer.drain()
+                    response_line = await asyncio.wait_for(
+                        remote_reader.readline(), timeout=Settings.request_timeout
+                    )
+                    if not response_line:
+                        raise RuntimeError("Пустой ответ апстрим-прокси")
+                    response_line_str = response_line.decode(errors="ignore").strip()
+                    parts = response_line_str.split(" ", 2)
+                    status_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+                    while True:
+                        header_line = await asyncio.wait_for(
+                            remote_reader.readline(), timeout=Settings.request_timeout
+                        )
+                        if header_line in (b"\r\n", b"\n", b""):
+                            break
+                    if status_code != 200:
+                        raise RuntimeError(
+                            f"Апстрим-прокси вернул статус {response_line_str}"
+                        )
+                else:
+                    remote_reader, remote_writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port),
+                        timeout=Settings.request_timeout,
+                    )
             except Exception as e:
                 logger.warning(
                     "Не удалось установить CONNECT к %s:%s: %s", host, port_str, e
                 )
+                if remote_writer is not None:
+                    remote_writer.close()
                 writer.write(f"HTTP/1.1 502 Bad Gateway: {e}\r\n\r\n".encode())
                 await writer.drain()
                 writer.close()
@@ -250,15 +340,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     host, port = host_header, 80
                 origin_path = path or "/"
 
+            remote_reader = None
+            remote_writer = None
             try:
-                remote_reader, remote_writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
-                    timeout=Settings.request_timeout
-                )
+                if Settings.upstream_proxy_host:
+                    remote_reader, remote_writer = await open_upstream_connection()
+                else:
+                    remote_reader, remote_writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port),
+                        timeout=Settings.request_timeout,
+                    )
             except Exception as e:
                 logger.warning(
                     "Не удалось подключиться к %s:%s: %s", host, port, e
                 )
+                if remote_writer is not None:
+                    remote_writer.close()
                 writer.write(f"HTTP/1.1 502 Bad Gateway: {e}\r\n\r\n".encode())
                 await writer.drain()
                 writer.close()
@@ -267,9 +364,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             fwd_headers = strip_hop_by_hop(headers)
             fwd_headers["Host"] = fwd_headers.get("Host") or host
             fwd_headers["Connection"] = "close"
+            if Settings.upstream_proxy_host:
+                if Settings.upstream_proxy_authorization:
+                    fwd_headers["Proxy-Authorization"] = (
+                        Settings.upstream_proxy_authorization
+                    )
+                fwd_headers.setdefault("Proxy-Connection", "close")
+
+            if Settings.upstream_proxy_host:
+                if parsed.scheme and parsed.netloc:
+                    request_target = path
+                else:
+                    scheme = parsed.scheme or "http"
+                    if (scheme == "http" and port == 80) or (
+                        scheme == "https" and port == 443
+                    ):
+                        host_port = host
+                    else:
+                        host_port = f"{host}:{port}"
+                    request_target = f"{scheme}://{host_port}{origin_path}"
+            else:
+                request_target = origin_path
 
             header_str = "".join(f"{k}: {v}\r\n" for k, v in fwd_headers.items())
-            req = f"{method} {origin_path} HTTP/1.1\r\n{header_str}\r\n"
+            req = f"{method} {request_target} HTTP/1.1\r\n{header_str}\r\n"
             remote_writer.write(req.encode())
             await remote_writer.drain()
             logger.debug(
@@ -277,7 +395,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 method,
                 host,
                 port,
-                f" ({origin_path})" if origin_path else "",
+                f" ({request_target})" if request_target else "",
             )
 
             async def pipe(r, w):
