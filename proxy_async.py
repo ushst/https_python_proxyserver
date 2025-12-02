@@ -26,6 +26,8 @@ class Settings:
     pass_file = os.getenv("PASS_FILE", "./pass")
     debug = os.getenv("DEBUG", "0").lower() in {"1", "true", "yes", "on"}
 
+    enable_ssl = os.getenv("ENABLE_SSL", "1").lower() in {"1", "true", "yes", "on"}
+
     ssl_certificate_path = os.getenv(
         "SSL_CERT", "/etc/letsencrypt/live/example.com/fullchain.pem"
     )
@@ -552,8 +554,16 @@ async def main():
     if Settings.debug:
         loop.set_debug(True)
         logger.debug("Режим asyncio debug включен")
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(Settings.ssl_certificate_path, Settings.ssl_private_key_path)
+    ssl_ctx = None
+    if Settings.enable_ssl:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(Settings.ssl_certificate_path, Settings.ssl_private_key_path)
+        logger.info("Запуск в режиме HTTPS-прокси")
+    else:
+        logger.warning(
+            "Запуск без TLS: входящие подключения принимаются как HTTP-прокси"
+        )
+
     server = await asyncio.start_server(
         handle_client, Settings.listen_host, Settings.listen_port, ssl=ssl_ctx
     )
