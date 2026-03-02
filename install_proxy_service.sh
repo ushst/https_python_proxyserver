@@ -13,6 +13,8 @@ PYTHON_BIN=${PYTHON_BIN:-$DEFAULT_PYTHON_BIN}
 WORKING_DIR=${WORKING_DIR:-$DEFAULT_WORKING_DIR}
 ENV_FILE=${ENV_FILE:-}
 AUTO_START=1
+COPY_TO_OPT=1
+DEPLOY_DIR=${DEPLOY_DIR:-}
 
 DEFAULT_SSL_CERT="/etc/letsencrypt/live/example.com/fullchain.pem"
 DEFAULT_SSL_KEY="/etc/letsencrypt/live/example.com/privkey.pem"
@@ -26,13 +28,15 @@ Options:
   -u USER       System user to run the service under (default: ${SERVICE_USER})
   -g GROUP      System group for the service (default: same as USER)
   -p PATH       Path to python executable (default: detected python3)
-  -w DIR        Working directory of the application (default: repository root)
+  -w DIR        Source application directory to install from (default: script directory)
+  -o DIR        Target deployment directory (default: /opt/<basename of source DIR>)
   -e FILE       Path to .env file to load (default: DIR/.env if exists)
+  -C            Do not copy project to /opt; run directly from DIR
   -N            Do not enable and start the service automatically
   -h            Show this help message
 
 Environment variables (take precedence over defaults but can be overridden by options):
-  SERVICE_NAME, SERVICE_USER, SERVICE_GROUP, PYTHON_BIN, WORKING_DIR, ENV_FILE
+  SERVICE_NAME, SERVICE_USER, SERVICE_GROUP, PYTHON_BIN, WORKING_DIR, DEPLOY_DIR, ENV_FILE
 USAGE
 }
 
@@ -228,14 +232,28 @@ ensure_user_can_read_or_prompt() {
   exit 1
 }
 
-while getopts ":n:u:g:p:w:e:Nh" opt; do
+sync_project_tree() {
+  local src=$1
+  local dst=$2
+
+  mkdir -p "$dst"
+  if command -v rsync &>/dev/null; then
+    rsync -a --delete "$src"/ "$dst"/
+  else
+    cp -a "$src"/. "$dst"/
+  fi
+}
+
+while getopts ":n:u:g:p:w:o:e:CNh" opt; do
   case "$opt" in
     n) SERVICE_NAME=$OPTARG ;;
     u) SERVICE_USER=$OPTARG ;;
     g) SERVICE_GROUP=$OPTARG ;;
     p) PYTHON_BIN=$OPTARG ;;
     w) WORKING_DIR=$OPTARG ;;
+    o) DEPLOY_DIR=$OPTARG ;;
     e) ENV_FILE=$OPTARG ;;
+    C) COPY_TO_OPT=0 ;;
     N) AUTO_START=0 ;;
     h)
       usage
@@ -278,6 +296,44 @@ if [[ ! -d $WORKING_DIR ]]; then
   exit 1
 fi
 
+SOURCE_DIR=$(readlink -f "$WORKING_DIR")
+if [[ -z $SOURCE_DIR ]]; then
+  SOURCE_DIR=$WORKING_DIR
+fi
+
+if [[ $COPY_TO_OPT -eq 1 ]]; then
+  if [[ -z $DEPLOY_DIR ]]; then
+    DEPLOY_DIR="/opt/$(basename "$SOURCE_DIR")"
+  fi
+  TARGET_DIR=$(readlink -m "$DEPLOY_DIR")
+  if [[ -z $TARGET_DIR ]]; then
+    TARGET_DIR=$DEPLOY_DIR
+  fi
+
+  if [[ $SOURCE_DIR != "$TARGET_DIR" ]]; then
+    echo "Deploying project from '$SOURCE_DIR' to '$TARGET_DIR'..."
+    sync_project_tree "$SOURCE_DIR" "$TARGET_DIR"
+  fi
+  WORKING_DIR=$TARGET_DIR
+else
+  WORKING_DIR=$SOURCE_DIR
+fi
+
+if [[ -n $ENV_FILE ]]; then
+  ENV_FILE_ABS=""
+  if [[ $ENV_FILE == /* ]]; then
+    ENV_FILE_ABS=$(readlink -m "$ENV_FILE")
+  else
+    ENV_FILE_ABS=$(readlink -m "$SOURCE_DIR/$ENV_FILE")
+  fi
+
+  if [[ $COPY_TO_OPT -eq 1 && $ENV_FILE_ABS == "$SOURCE_DIR"/* ]]; then
+    ENV_FILE="$WORKING_DIR/${ENV_FILE_ABS#"$SOURCE_DIR"/}"
+  else
+    ENV_FILE=$ENV_FILE_ABS
+  fi
+fi
+
 if ! id "$SERVICE_USER" &>/dev/null; then
   echo "User '$SERVICE_USER' does not exist." >&2
   exit 1
@@ -287,6 +343,8 @@ if ! getent group "$SERVICE_GROUP" &>/dev/null; then
   echo "Group '$SERVICE_GROUP' does not exist." >&2
   exit 1
 fi
+
+chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$WORKING_DIR"
 
 if ! command -v systemctl &>/dev/null; then
   echo "systemctl command not found. This script requires systemd." >&2
