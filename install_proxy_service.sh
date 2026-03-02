@@ -14,6 +14,9 @@ WORKING_DIR=${WORKING_DIR:-$DEFAULT_WORKING_DIR}
 ENV_FILE=${ENV_FILE:-}
 AUTO_START=1
 
+DEFAULT_SSL_CERT="/etc/letsencrypt/live/example.com/fullchain.pem"
+DEFAULT_SSL_KEY="/etc/letsencrypt/live/example.com/privkey.pem"
+
 usage() {
   cat <<USAGE
 Usage: sudo $0 [options]
@@ -31,6 +34,198 @@ Options:
 Environment variables (take precedence over defaults but can be overridden by options):
   SERVICE_NAME, SERVICE_USER, SERVICE_GROUP, PYTHON_BIN, WORKING_DIR, ENV_FILE
 USAGE
+}
+
+trim_whitespace() {
+  local s=$1
+  # shellcheck disable=SC2001
+  s=$(echo "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  printf '%s' "$s"
+}
+
+strip_quotes() {
+  local s=$1
+  if [[ $s == \"*\" && $s == *\" ]]; then
+    s=${s:1:${#s}-2}
+  elif [[ $s == \'*\' && $s == *\' ]]; then
+    s=${s:1:${#s}-2}
+  fi
+  printf '%s' "$s"
+}
+
+get_env_var() {
+  local key=$1
+  local file=$2
+  local line value
+
+  line=$(
+    awk -F= -v wanted="$key" '
+      /^[[:space:]]*#/ {next}
+      {
+        left=$1
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", left)
+        sub(/^export[[:space:]]+/, "", left)
+        if (left == wanted) {
+          print $0
+        }
+      }
+    ' "$file" | tail -n1
+  )
+
+  if [[ -z $line ]]; then
+    return 1
+  fi
+
+  value=${line#*=}
+  value=$(trim_whitespace "$value")
+  value=$(strip_quotes "$value")
+  printf '%s' "$value"
+}
+
+resolve_path() {
+  local p=$1
+  if [[ -z $p ]]; then
+    printf '%s' ""
+    return 0
+  fi
+  if [[ $p == /* ]]; then
+    printf '%s' "$p"
+  else
+    printf '%s/%s' "$WORKING_DIR" "$p"
+  fi
+}
+
+can_user_read_file() {
+  local user=$1
+  local path=$2
+  if command -v runuser &>/dev/null; then
+    runuser -u "$user" -- test -r "$path"
+    return $?
+  fi
+  su -s /bin/sh "$user" -c "test -r \"\$1\"" -- "$path"
+}
+
+prompt_yes_no() {
+  local message=$1
+  local answer
+  while true; do
+    read -r -p "$message [y/N]: " answer || return 1
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no|"") return 1 ;;
+      *) echo "Please answer yes or no." ;;
+    esac
+  done
+}
+
+grant_user_read_access() {
+  local user=$1
+  local original_path=$2
+  local resolved_path
+  local current
+  local -a dir_list=()
+
+  ensure_setfacl_available_or_install() {
+    local install_cmd=""
+
+    if command -v setfacl &>/dev/null; then
+      return 0
+    fi
+
+    if command -v apt-get &>/dev/null; then
+      install_cmd="apt-get update && apt-get install -y acl"
+    elif command -v dnf &>/dev/null; then
+      install_cmd="dnf install -y acl"
+    elif command -v yum &>/dev/null; then
+      install_cmd="yum install -y acl"
+    elif command -v zypper &>/dev/null; then
+      install_cmd="zypper install -y acl"
+    elif command -v pacman &>/dev/null; then
+      install_cmd="pacman -Sy --noconfirm acl"
+    elif command -v apk &>/dev/null; then
+      install_cmd="apk add acl"
+    fi
+
+    if [[ -z $install_cmd ]]; then
+      echo "setfacl command not found and package manager is unknown." >&2
+      echo "Install ACL tools manually, then run the script again." >&2
+      return 1
+    fi
+
+    if prompt_yes_no "setfacl is missing. Install ACL tools now?"; then
+      if ! sh -c "$install_cmd"; then
+        echo "Failed to install ACL tools using: $install_cmd" >&2
+        return 1
+      fi
+      if ! command -v setfacl &>/dev/null; then
+        echo "ACL tools were installed, but setfacl is still unavailable." >&2
+        return 1
+      fi
+      return 0
+    fi
+
+    echo "Install ACL tools manually:" >&2
+    echo "  sudo $install_cmd" >&2
+    return 1
+  }
+
+  if ! ensure_setfacl_available_or_install; then
+    return 1
+  fi
+
+  resolved_path=$(readlink -f "$original_path")
+  if [[ -z $resolved_path ]]; then
+    resolved_path=$original_path
+  fi
+
+  collect_dirs() {
+    local p=$1
+    local d
+    d=$(dirname "$p")
+    while [[ $d != "/" && -n $d ]]; do
+      dir_list+=("$d")
+      d=$(dirname "$d")
+    done
+  }
+
+  collect_dirs "$original_path"
+  collect_dirs "$resolved_path"
+
+  for current in "${dir_list[@]}"; do
+    setfacl -m "u:${user}:x" "$current"
+  done
+
+  setfacl -m "u:${user}:r" "$resolved_path"
+  if [[ $original_path != "$resolved_path" ]]; then
+    setfacl -m "u:${user}:r" "$original_path" 2>/dev/null || true
+  fi
+}
+
+ensure_user_can_read_or_prompt() {
+  local user=$1
+  local path=$2
+  local label=$3
+
+  if can_user_read_file "$user" "$path"; then
+    return 0
+  fi
+
+  echo "User '$user' cannot read $label '$path'." >&2
+  if prompt_yes_no "Grant read access for '$user' to '$path'?"; then
+    if ! grant_user_read_access "$user" "$path"; then
+      echo "Failed to grant access for '$user' to '$path'." >&2
+      exit 1
+    fi
+    if ! can_user_read_file "$user" "$path"; then
+      echo "Access update was attempted, but '$user' still cannot read '$path'." >&2
+      exit 1
+    fi
+    echo "Access granted for '$user' to '$path'."
+    return 0
+  fi
+
+  echo "Installation cancelled." >&2
+  exit 1
 }
 
 while getopts ":n:u:g:p:w:e:Nh" opt; do
@@ -84,11 +279,13 @@ if [[ ! -d $WORKING_DIR ]]; then
 fi
 
 if ! id "$SERVICE_USER" &>/dev/null; then
-  echo "Warning: user '$SERVICE_USER' does not exist. The service may fail to start." >&2
+  echo "User '$SERVICE_USER' does not exist." >&2
+  exit 1
 fi
 
 if ! getent group "$SERVICE_GROUP" &>/dev/null; then
-  echo "Warning: group '$SERVICE_GROUP' does not exist. The service may fail to start." >&2
+  echo "Group '$SERVICE_GROUP' does not exist." >&2
+  exit 1
 fi
 
 if ! command -v systemctl &>/dev/null; then
@@ -104,6 +301,37 @@ if [[ -n $ENV_FILE ]]; then
 elif [[ -f ${WORKING_DIR}/.env ]]; then
   SELECTED_ENV_FILE=${WORKING_DIR}/.env
 fi
+
+SSL_CERT_VALUE=$DEFAULT_SSL_CERT
+SSL_KEY_VALUE=$DEFAULT_SSL_KEY
+if [[ -n $SELECTED_ENV_FILE ]]; then
+  if [[ -f $SELECTED_ENV_FILE ]]; then
+    if cert_from_env=$(get_env_var "SSL_CERT" "$SELECTED_ENV_FILE"); then
+      SSL_CERT_VALUE=$cert_from_env
+    fi
+    if key_from_env=$(get_env_var "SSL_KEY" "$SELECTED_ENV_FILE"); then
+      SSL_KEY_VALUE=$key_from_env
+    fi
+  else
+    echo "Environment file '$SELECTED_ENV_FILE' does not exist." >&2
+    exit 1
+  fi
+fi
+
+SSL_CERT_PATH=$(resolve_path "$SSL_CERT_VALUE")
+SSL_KEY_PATH=$(resolve_path "$SSL_KEY_VALUE")
+
+if [[ ! -f $SSL_CERT_PATH ]]; then
+  echo "SSL certificate file '$SSL_CERT_PATH' does not exist." >&2
+  exit 1
+fi
+if [[ ! -f $SSL_KEY_PATH ]]; then
+  echo "SSL private key file '$SSL_KEY_PATH' does not exist." >&2
+  exit 1
+fi
+
+ensure_user_can_read_or_prompt "$SERVICE_USER" "$SSL_CERT_PATH" "certificate"
+ensure_user_can_read_or_prompt "$SERVICE_USER" "$SSL_KEY_PATH" "key"
 
 {
   cat <<SERVICE
