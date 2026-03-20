@@ -23,6 +23,49 @@
    pip install -r requirements.txt
    ```
 
+## Готовый контейнерный образ
+
+Если не хочется собирать окружение вручную, можно использовать уже опубликованный образ в GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/krolchonok/amnezia-wg-easy:latest
+```
+
+Также доступен фиксированный тег `14`:
+
+```bash
+docker pull ghcr.io/krolchonok/amnezia-wg-easy:14
+```
+
+Пример запуска:
+
+```bash
+docker run -d \
+  --name amnezia-wg-easy \
+  --restart unless-stopped \
+  -p 51820:51820/udp \
+  -p 51821:51821/tcp \
+  -v ./data:/etc/amnezia/amnezia-wg-easy \
+  ghcr.io/krolchonok/amnezia-wg-easy:latest
+```
+
+Если планируете использовать Docker Compose, укажите тот же образ:
+
+```yaml
+services:
+  amnezia-wg-easy:
+    image: ghcr.io/krolchonok/amnezia-wg-easy:latest
+    container_name: amnezia-wg-easy
+    restart: unless-stopped
+    ports:
+      - "51820:51820/udp"
+      - "51821:51821/tcp"
+    volumes:
+      - ./data:/etc/amnezia/amnezia-wg-easy
+```
+
+Перед запуском проверьте, какие переменные окружения, директории данных и порты ожидает именно ваш форк `amnezia-wg-easy`. Если в опубликованном образе они отличаются от upstream-конфигурации, скорректируйте пример выше под вашу сборку.
+
 ## Настройка
 1. Создайте файл `.env`, основываясь на примере `.env_example`:
    ```bash
@@ -84,4 +127,3 @@ sudo ./install_proxy_service.sh \
 - `proxy_async.py` — основной файл сервера.
 - `manage_users.py` — вспомогательный скрипт для управления пользователями.
 - `requirements.txt` — список зависимостей.
-
